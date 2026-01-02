@@ -157,6 +157,27 @@ class PathCommand(CommandTerm):
             device=self.device,
         )
 
+        # Verification prints to help debug which PATH config was applied at runtime.
+        # These prints are safe and informative: they show the active path_config dict
+        # and (when available) the module-level PATH_CFG variable from the tracking config module.
+        try:
+            print(f"[VERIFY] PathCommand.cfg.path_config = {self.cfg.path_config}")
+            print(f"[VERIFY] path_cfg_resolutions = {self.path_cfg_resolutions}")
+            import importlib
+
+            try:
+                cfg_mod = importlib.import_module(
+                    "isaaclab_tasks.manager_based.path_tracking.end_to_end.tracking_teacher_env_cfg"
+                )
+                # print module PATH_CFG and source file for confirmation
+                print(f"[VERIFY] tracking_teacher_env_cfg.PATH_CFG = {getattr(cfg_mod, 'PATH_CFG', None)!r}")
+                print(f"[VERIFY] tracking_teacher_env_cfg.__file__ = {getattr(cfg_mod, '__file__', None)!r}")
+            except Exception:
+                # Module may not be importable in some contexts; ignore in that case
+                pass
+        except Exception:
+            pass
+
         self.pos_err_tolerance = torch.full((self.num_envs,), self.path_initial_params[2], device=self.device)
         self.tol_res_init = self.path_cfg_resolutions[2]
         self.tol_res_dynamic = self.path_cfg_resolutions[2]

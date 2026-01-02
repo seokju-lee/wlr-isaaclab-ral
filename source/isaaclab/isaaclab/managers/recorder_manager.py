@@ -14,13 +14,26 @@ from prettytable import PrettyTable
 from typing import TYPE_CHECKING
 
 from isaaclab.utils import configclass
-from isaaclab.utils.datasets import EpisodeData, HDF5DatasetFileHandler
+# from isaaclab.utils.datasets import EpisodeData, HDF5DatasetFileHandler
 
 from .manager_base import ManagerBase, ManagerTermBase
 from .manager_term_cfg import RecorderTermCfg
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedEnv
+
+
+class MockEpisodeData:
+    def __init__(self):
+        self.env_id = None
+        self.success = False
+        self.data = {}
+
+    def add(self, key, value):
+        pass
+
+    def is_empty(self):
+        return True
 
 
 class DatasetExportMode(enum.IntEnum):
@@ -36,7 +49,7 @@ class DatasetExportMode(enum.IntEnum):
 class RecorderManagerBaseCfg:
     """Base class for configuring recorder manager terms."""
 
-    dataset_file_handler_class_type: type = HDF5DatasetFileHandler
+    dataset_file_handler_class_type: type = None  # HDF5DatasetFileHandler
 
     dataset_export_dir_path: str = "/tmp/isaaclab/logs"
     """The directory path where the recorded datasets are exported."""
@@ -151,21 +164,23 @@ class RecorderManager(ManagerBase):
             raise TypeError("Configuration for the recorder manager is not of type RecorderManagerBaseCfg.")
 
         # create episode data buffer indexed by environment id
-        self._episodes: dict[int, EpisodeData] = dict()
+        self._episodes: dict[int, object] = dict()
         for env_id in range(env.num_envs):
-            self._episodes[env_id] = EpisodeData()
+            self._episodes[env_id] = MockEpisodeData()
 
         env_name = getattr(env.cfg, "env_name", None)
 
         self._dataset_file_handler = None
-        if cfg.dataset_export_mode != DatasetExportMode.EXPORT_NONE:
+        self._dataset_file_handler = None
+        if cfg.dataset_export_mode != DatasetExportMode.EXPORT_NONE and cfg.dataset_file_handler_class_type is not None:
             self._dataset_file_handler = cfg.dataset_file_handler_class_type()
             self._dataset_file_handler.create(
                 os.path.join(cfg.dataset_export_dir_path, cfg.dataset_filename), env_name=env_name
             )
 
         self._failed_episode_dataset_file_handler = None
-        if cfg.dataset_export_mode == DatasetExportMode.EXPORT_SUCCEEDED_FAILED_IN_SEPARATE_FILES:
+        self._failed_episode_dataset_file_handler = None
+        if cfg.dataset_export_mode == DatasetExportMode.EXPORT_SUCCEEDED_FAILED_IN_SEPARATE_FILES and cfg.dataset_file_handler_class_type is not None:
             self._failed_episode_dataset_file_handler = cfg.dataset_file_handler_class_type()
             self._failed_episode_dataset_file_handler.create(
                 os.path.join(cfg.dataset_export_dir_path, f"{cfg.dataset_filename}_failed"), env_name=env_name
@@ -272,12 +287,12 @@ class RecorderManager(ManagerBase):
             term.reset(env_ids=env_ids)
 
         for env_id in env_ids:
-            self._episodes[env_id] = EpisodeData()
+            self._episodes[env_id] = MockEpisodeData()
 
         # nothing to log here
         return {}
 
-    def get_episode(self, env_id: int) -> EpisodeData:
+    def get_episode(self, env_id: int) -> object:
         """Returns the episode data for the given environment id.
 
         Args:
@@ -286,7 +301,7 @@ class RecorderManager(ManagerBase):
         Returns:
             The episode data for the given environment id.
         """
-        return self._episodes.get(env_id, EpisodeData())
+        return self._episodes.get(env_id, MockEpisodeData())
 
     def add_to_episodes(self, key: str, value: torch.Tensor | dict, env_ids: Sequence[int] | None = None):
         """Adds the given key-value pair to the episodes for the given environment ids.
@@ -318,7 +333,7 @@ class RecorderManager(ManagerBase):
 
         for value_index, env_id in enumerate(env_ids):
             if env_id not in self._episodes:
-                self._episodes[env_id] = EpisodeData()
+                self._episodes[env_id] = MockEpisodeData()
                 self._episodes[env_id].env_id = env_id
             self._episodes[env_id].add(key, value[value_index])
 
@@ -448,7 +463,7 @@ class RecorderManager(ManagerBase):
                 else:
                     self._exported_failed_episode_count[env_id] = self._exported_failed_episode_count.get(env_id, 0) + 1
             # Reset the episode buffer for the given environment after export
-            self._episodes[env_id] = EpisodeData()
+            self._episodes[env_id] = MockEpisodeData()
 
         if need_to_flush:
             if self._dataset_file_handler is not None:

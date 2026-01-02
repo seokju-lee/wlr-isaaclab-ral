@@ -8,6 +8,7 @@
 """Launch Isaac Sim Simulator first."""
 
 import argparse
+import os
 import sys
 
 from isaaclab.app import AppLauncher
@@ -23,11 +24,15 @@ parser.add_argument("--video_length", type=int, default=200, help="Length of the
 parser.add_argument("--video_interval", type=int, default=2000, help="Interval between video recordings (in steps).")
 parser.add_argument("--num_envs", type=int, default=None, help="Number of environments to simulate.")
 parser.add_argument("--task", type=str, default=None, help="Name of the task.")
+parser.add_argument("--expert_type", type=str, default="straight", help="Type of expert to use. (straight, turn, drift)")
+parser.add_argument("--stage", type=int, default=1, help="Stage of training to use. (1: pretraining, 2: mixing)")
+parser.add_argument("--pipeline", type=str, default="E2E", help="RL Pipeline to use. (MoE, baseline)")
 parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment")
 parser.add_argument("--max_iterations", type=int, default=None, help="RL Policy training iterations.")
 parser.add_argument(
     "--distributed", action="store_true", default=False, help="Run training with multiple GPUs or nodes."
 )
+parser.add_argument("--expert_data_dir", type=str, default=None, help="Path to directory containing moe_checkpoints (for Stage 2).")
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
@@ -41,6 +46,11 @@ if args_cli.video:
 # clear out sys.argv for Hydra
 sys.argv = [sys.argv[0]] + hydra_args
 
+# If stage==1 and an expert_type was provided, set the tracking PATH_CFG via env var
+# so that the config module picks it up when imported later.
+if args_cli.stage == 1 and args_cli.expert_type is not None:
+    os.environ["RSL_RL_PATH_CFG"] = args_cli.expert_type
+    print(f"[INFO] Set environment variable RSL_RL_PATH_CFG={args_cli.expert_type}")
 # launch omniverse app
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
@@ -110,6 +120,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         args_cli.max_iterations if args_cli.max_iterations is not None else agent_cfg.max_iterations
     )
 
+    # PATH_CFG is now set earlier (after CLI parsing) to ensure config modules
+    # see the selection before Hydra/parsing occurs.
+
     # set the environment seed
     # note: certain randomizations occur in the environment initialization so we set the seed here
     env_cfg.seed = agent_cfg.seed
@@ -130,12 +143,21 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     log_root_path = os.path.abspath(log_root_path)
     print(f"[INFO] Logging experiment in directory: {log_root_path}")
     # specify directory for logging runs: {time-stamp}_{run_name}
-    log_dir = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    log_dir_name = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     # The Ray Tune workflow extracts experiment name using the logging line below, hence, do not change it (see PR #2346, comment-2819298849)
-    print(f"Exact experiment name requested from command line: {log_dir}")
+    print(f"Exact experiment name requested from command line: {log_dir_name}")
     if agent_cfg.run_name:
-        log_dir += f"_{agent_cfg.run_name}"
-    log_dir = os.path.join(log_root_path, log_dir)
+        log_dir_name += f"_{agent_cfg.run_name}"
+
+    # Organize logs by stage/expert
+    if args_cli.stage == 1 and args_cli.expert_type:
+        # e.g. logs/rsl_rl/experiment/expert_straight/2023-01-01_00-00-00
+        log_dir = os.path.join(log_root_path, args_cli.expert_type, log_dir_name)
+    elif args_cli.stage == 2:
+        # e.g. logs/rsl_rl/experiment/moe_merge/2023-01-01_00-00-00
+        log_dir = os.path.join(log_root_path, "moe_merge", log_dir_name)
+    else:
+        log_dir = os.path.join(log_root_path, log_dir_name)
 
     # create isaac environment
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
@@ -163,8 +185,18 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # wrap around environment for rsl-rl
     env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
 
-    # create runner from rsl-rl
-    runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
+    # Pass stage/expert_type to runner via agent config dict so runners can react accordingly
+    agent_cfg_dict = agent_cfg.to_dict()
+    agent_cfg_dict["stage"] = args_cli.stage
+    agent_cfg_dict["expert_type"] = args_cli.expert_type
+    agent_cfg_dict["expert_data_dir"] = args_cli.expert_data_dir
+
+    if args_cli.pipeline == "MoE":
+        from rsl_rl.rsl_rl.runners.on_policy_moe_runner import OnPolicyMoERunner
+        runner = OnPolicyMoERunner(env, agent_cfg_dict, log_dir=log_dir, device=agent_cfg.device)
+    else:
+        runner = OnPolicyRunner(env, agent_cfg_dict, log_dir=log_dir, device=agent_cfg.device)
+
     # write git state to logs
     runner.add_git_repo_to_log(__file__)
     # load the checkpoint

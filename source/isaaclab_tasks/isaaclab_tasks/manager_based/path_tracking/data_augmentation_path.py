@@ -13,11 +13,93 @@ IDX_WHEELS = [12, 13, 14, 15]
 
 
 def get_symmetric_states_path(obs, actions, scan=False, **kwargs):
+    # Detect 3D input
+    input_3d = False
+    b, s = None, None
+
+    if obs is not None and obs.ndim == 3:
+        input_3d = True
+        b, s, d = obs.shape
+    elif actions is not None and actions.ndim == 3:
+        input_3d = True
+        b, s, d_a = actions.shape
+
+    if input_3d:
+        obs_flat = None
+        if obs is not None:
+            if obs.ndim == 3:
+                obs_flat = obs.reshape(-1, obs.shape[-1])
+            else:
+                obs_flat = obs
+
+        actions_flat = None
+        if actions is not None:
+            if actions.ndim == 3:
+                actions_flat = actions.reshape(-1, actions.shape[-1])
+            else:
+                actions_flat = actions
+
+        obs_aug_flat, actions_aug_flat = _symmetry_observations(obs_flat, actions_flat, scan)
+
+        obs_aug = None
+        if obs_aug_flat is not None:
+            d = obs_aug_flat.shape[-1]
+            obs_aug = obs_aug_flat.reshape(b * 4, s, d)
+
+        actions_aug = None
+        if actions_aug_flat is not None:
+            d_a = actions_aug_flat.shape[-1]
+            actions_aug = actions_aug_flat.reshape(b * 4, s, d_a)
+
+        return obs_aug, actions_aug
+
     obs_aug, actions_aug = _symmetry_observations(obs, actions, scan)
     return obs_aug, actions_aug
 
 
 def get_symmetric_states_path_scan(obs, actions, scan=True, **kwargs):
+    # Detect 3D input
+    input_3d = False
+    b, s = None, None
+
+    if obs is not None and obs.ndim == 3:
+        input_3d = True
+        b, s, d = obs.shape
+    elif actions is not None and actions.ndim == 3:
+        input_3d = True
+        b, s, d_a = actions.shape
+
+    if input_3d:
+        obs_flat = None
+        if obs is not None:
+            if obs.ndim == 3:
+                obs_flat = obs.reshape(-1, obs.shape[-1])
+            else:
+                obs_flat = obs
+
+        actions_flat = None
+        if actions is not None:
+            if actions.ndim == 3:
+                actions_flat = actions.reshape(-1, actions.shape[-1])
+            else:
+                actions_flat = actions
+
+        obs_aug_flat, actions_aug_flat = _symmetry_observations(obs_flat, actions_flat, scan)
+
+        obs_aug = None
+        if obs_aug_flat is not None:
+            # Need d from obs_aug_flat if obs was None
+            d = obs_aug_flat.shape[-1]
+            obs_aug = obs_aug_flat.reshape(b * 4, s, d)
+
+        actions_aug = None
+        if actions_aug_flat is not None:
+            # Need d from actions_aug_flat
+            d_a = actions_aug_flat.shape[-1]
+            actions_aug = actions_aug_flat.reshape(b * 4, s, d_a)
+
+        return obs_aug, actions_aug
+
     obs_aug, actions_aug = _symmetry_observations(obs, actions, scan)
     return obs_aug, actions_aug
 
@@ -201,7 +283,7 @@ def _transform_obs_left_right(obs, scan: bool):
     num_obs = obs.shape[1]
     idx = 0
 
-    ## Proprioceptive
+    # Proprioceptive
     # joint pos rel
     dim = 12
     obs[:, idx : idx + dim] = _switch_joints_lr(obs[:, idx : idx + dim])
@@ -278,13 +360,13 @@ def _transform_obs_left_right(obs, scan: bool):
     # idx += dim
 
     # NEW add: delete
-    ## Exteroception
+    # Exteroception
     # if scan:
     #     dim = 176
     #     obs[:, idx : idx + dim] = obs[:, idx : idx + dim].view(-1, 11, 16).flip(dims=[1]).view(-1, 11 * 16)
     #     idx += dim
 
-    ## Track
+    # Track
     # # waypoint interval
     # dim = 1
     # obs[:, idx : idx + dim] = obs[:, idx : idx + dim]
@@ -300,7 +382,7 @@ def _transform_obs_left_right(obs, scan: bool):
     # obs[:, idx : idx + dim] = obs[:, idx : idx + dim]
     # idx += dim
 
-    ## Waypoints
+    # Waypoints
     # waypint_list_time, 10 waypoints (x, y, yaw)
     dim = 3
     # Transformation tensor for x and y
@@ -320,7 +402,6 @@ def _transform_obs_left_right(obs, scan: bool):
         obs[:, idx:] = obs[:, idx:]
         idx = num_obs
     # ===========================================================
-
 
     # # waypoint_list_fixed, 10 waypoints (x, y, yaw)
     # dim = 3
@@ -391,7 +472,7 @@ def _transform_obs_front_back(obs, scan: bool):
     num_obs = obs.shape[1]
     idx = 0
 
-    ## Proprioceptive
+    # Proprioceptive
     # joint pos
     dim = 12
     obs[:, idx : idx + dim] = _switch_joints_fb(obs[:, idx : idx + dim])
@@ -468,13 +549,13 @@ def _transform_obs_front_back(obs, scan: bool):
     # idx += dim
 
     # NEW add: delete
-    ## Exteroception
+    # Exteroception
     # if scan:
     #     dim = 176
     #     obs[:, idx : idx + dim] = obs[:, idx : idx + dim].view(-1, 11, 16).flip(dims=[2]).view(-1, 11 * 16)
     #     idx += dim
 
-    ## Track
+    # Track
     # # waypoint interval
     # dim = 1
     # obs[:, idx : idx + dim] = obs[:, idx : idx + dim]
@@ -490,7 +571,7 @@ def _transform_obs_front_back(obs, scan: bool):
     # obs[:, idx : idx + dim] = obs[:, idx : idx + dim]
     # idx += dim
 
-    ## Waypoints
+    # Waypoints
     # waypint_list_time, 10 waypoints (x, y, yaw)
     dim = 3
     # Transformation tensor for x and y
@@ -506,7 +587,6 @@ def _transform_obs_front_back(obs, scan: bool):
         obs[:, idx + 2][yaw < 0] = -torch.pi - yaw[yaw < 0]
         # Move to the next waypoint
         idx += dim
-
 
     # NEW add: aggressiveness scalar g
     # ===== 여기부터 추가: 남은 tail(예: g, 기타 스칼라들) 그냥 통과 =====

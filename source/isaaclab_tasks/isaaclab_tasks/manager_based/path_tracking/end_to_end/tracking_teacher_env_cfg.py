@@ -3,6 +3,7 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
+import os
 from dataclasses import MISSING
 
 import isaaclab.sim as sim_utils
@@ -16,7 +17,7 @@ from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.scene import InteractiveSceneCfg
-from isaaclab.sensors import ContactSensorCfg, RayCasterCfg
+from isaaclab.sensors import ContactSensorCfg, RayCasterCfg, patterns
 from isaaclab.terrains import TerrainImporterCfg
 from isaaclab.utils import configclass
 from isaaclab.utils.assets import ISAACLAB_NUCLEUS_DIR
@@ -24,8 +25,6 @@ from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
 
 import isaaclab_tasks.manager_based.path_tracking.end_to_end.mdp as mdp
 from isaaclab_tasks.manager_based.path_tracking.end_to_end.mdp import ObservationHistoryTermCfg
-from isaaclab.sensors import ContactSensorCfg, RayCasterCfg, patterns
-
 ##
 # Pre-defined configs
 ##
@@ -38,6 +37,8 @@ WHEEL_JOINT_NAMES = [".*WHEEL"]
 WHEEL_BODY_NAMES = [".*WHEEL_L"]
 
 USE_AYRO = True
+PATH_CFG = os.environ.get("RSL_RL_PATH_CFG", "straight")
+print(f"[INFO] tracking_teacher_env_cfg: Effective PATH_CFG = '{PATH_CFG}'")
 ##
 # Scene definition
 ##
@@ -107,6 +108,57 @@ class MySceneCfg(InteractiveSceneCfg):
 # MDP settings
 ##
 
+# Explanation of Parameters:
+# - spline_angle_range (deg): The range of angles between consecutive waypoints.
+#                             Higher values = sharper turns/curvier path.
+# - rotate_angle_range (deg): The range of change in the robot's goal orientation relative to the path.
+#                             Higher values = robot faces more sideways/drifts relative to movement.
+# - pos_tolerance_range (m):  Acceptable error from the path before termination/penalty.
+
+if PATH_CFG == 'straight':
+    MAX_SPEED = 4.5  # Max feasible speed
+    _path_config_dict = {
+        "spline_angle_range": (0.0, 5.0),  # Very straight
+        "rotate_angle_range": (0.0, 5.0),  # Aligned with path
+        "pos_tolerance_range": (0.10, 0.15),
+        "terrain_level_range": (0, 0),
+        "resolution": [10.0, 5.0, 0.1, 1],
+        "initial_params": [0.0, 0.0, 0.10, 0],
+    }
+elif PATH_CFG == 'turn':
+    MAX_SPEED = 1.5  # Low speed for sharp turns
+    # Turn Config: Sharp angles & Finding path
+    _path_config_dict = {
+        "spline_angle_range": (45.0, 90.0),   # Sharp curves
+        "rotate_angle_range": (0.0, 180.0),   # Path can start anywhere (turn to find)
+        "pos_tolerance_range": (0.20, 0.3),
+        "terrain_level_range": (0, 0),
+        "resolution": [5.0, 10.0, 0.2, 1],
+        "initial_params": [60.0, 90.0, 0.20, 0],
+    }
+elif PATH_CFG == 'drift':
+    # Drift Config: High speed + Moderate curves
+    MAX_SPEED = 3.5
+    _path_config_dict = {
+        "spline_angle_range": (20.0, 60.0),   # Curves suitable for drifting
+        "rotate_angle_range": (0.0, 45.0),    # Mostly aligned start, drift happens in curves
+        "pos_tolerance_range": (0.20, 0.3),
+        "terrain_level_range": (0, 0),
+        "resolution": [10.0, 12.0, 0.2, 1],
+        "initial_params": [30.0, 20.0, 0.25, 0],
+    }
+else:
+    # Default (Merge) fallback: Covers ALL ranges
+    MAX_SPEED = 4.5
+    _path_config_dict = {
+        "spline_angle_range": (0.0, 90.0),    # Straight to Sharp
+        "rotate_angle_range": (0.0, 180.0),   # Front to Back
+        "pos_tolerance_range": (0.10, 0.3),
+        "terrain_level_range": (0, 0),
+        "resolution": [5.0, 12.0, 0.2, 1],
+        "initial_params": [0.0, 0.0, 0.20, 0],
+    }
+
 
 @configclass
 class CommandsCfg:
@@ -118,62 +170,13 @@ class CommandsCfg:
         debug_vis=True,
         num_waypoints=10,
 
-        # Original config
-        # path_config={
-        #     "spline_angle_range": (0.0, 120.0),
-        #     "rotate_angle_range": (0.0, 150.0),
-        #     # NEW add 
-        #     "pos_tolerance_range": (0.2, 0.2), # original
-        #     # "pos_tolerance_range": (0.35, 0.35),
-        #     "terrain_level_range": (0, 0),
-        #     "resolution": [10.0, 10.0, 0.2, 1],
-        #     # "initial_params": [30.0, 40.0, 0.35, 0], # [spline_angle, rotate_angle, pos_tolerance, terrain_level]
-        #     "initial_params": [30.0, 40.0, 0.2, 0], # [spline_angle, rotate_angle, pos_tolerance, terrain_level]
-        # },
-        # max_speed=5.0,
-
         # NEW add: aggressiveness scalar g
-        use_ayro = USE_AYRO,
+        use_ayro=USE_AYRO,
         rel_standing_envs=0.0,
 
-        # Straight Config
-        path_config = {
-            "spline_angle_range": (0.0, 8.0),      
-            "rotate_angle_range": (0.0, 8.0),
-            "pos_tolerance_range": (0.15, 0.2),   
-            "terrain_level_range": (0, 0),
-            "resolution": [10.0, 8.0, 0.2, 1],
-            "initial_params": [6.0, 6.0, 0.20, 0],
-        },
-        max_speed=7.0,
-
-        # Turn Config
-        # path_config = {
-        #     "spline_angle_range": (8.0, 80.0),     
-        #     "rotate_angle_range": (12.0, 100.0),
-        #     "pos_tolerance_range": (0.20, 0.2),   
-        #     "terrain_level_range": (0, 0),
-        #     "resolution": [10.0, 10.0, 0.2, 1],
-        #     "initial_params": [18.0, 40.0, 0.20, 0],
-        # },
-        # max_speed = 1.5,
-
-        # # Drift Config
-        # path_config = {
-        #     "spline_angle_range": (60.0, 120.0),   
-        #     "rotate_angle_range": (60.0, 150.0),
-        #     "pos_tolerance_range": (0.25, 0.3),   
-        #     "terrain_level_range": (0, 0),
-        #     "resolution": [10.0, 12.0, 0.2, 1],
-        #     "initial_params": [60.0, 60.0, 0.25, 0],
-        # },
-        # max_speed = 4.5,
-
-
-
-        
-        # rel_standing_envs=0.0,    
-        )
+        path_config=_path_config_dict,
+        max_speed=MAX_SPEED,
+    )
 
 
 @configclass
@@ -191,8 +194,8 @@ class ActionsCfg:
     # NEW add: aggressiveness scalar g
     yaw_aggressiveness = mdp.AggressivenessActionCfg(
         asset_name="robot",
-        scale=0.5, # [-1,1] 그대로 받게 두고, mapping 은 ActionTerm 안에서
-        offset=0.5, # [-1,1] 그대로 받게 두고, mapping 은 ActionTerm 안에서
+        scale=0.5,  # [-1,1] 그대로 받게 두고, mapping 은 ActionTerm 안에서
+        offset=0.5,  # [-1,1] 그대로 받게 두고, mapping 은 ActionTerm 안에서
     )
 
 # @configclass
@@ -221,7 +224,7 @@ class ActionsCfg:
 #         history_joint_pos_error = ObservationHistoryTermCfg(
 #             func=mdp.ObservationHistory,
 #             params={"method": "joint_pos_error"},
-#             history_indices=[-1, -3, -5], 
+#             history_indices=[-1, -3, -5],
 #             asset_cfg=SceneEntityCfg("robot", joint_names=LEG_JOINT_NAMES,
 #                                      joint_ids=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]), # have to manually specify joint_ids here
 #             noise=Unoise(n_min=-0.01, n_max=0.01),
@@ -229,7 +232,7 @@ class ActionsCfg:
 #         history_joint_vel = ObservationHistoryTermCfg(
 #             func=mdp.ObservationHistory,
 #             params={"method": "joint_vel"},
-#             history_indices=[-3, -5], 
+#             history_indices=[-3, -5],
 #             noise=Unoise(n_min=-1.5, n_max=1.5),
 #         )  # 2*16
 #         history_root_lin_vel = ObservationHistoryTermCfg(
@@ -318,7 +321,6 @@ class ActionsCfg:
 #     policy: PolicyCfg = PolicyCfg()
 
 
-
 # NEW add
 @configclass
 class ObservationsCfg:
@@ -347,7 +349,7 @@ class ObservationsCfg:
         # history_joint_pos_error = ObservationHistoryTermCfg(
         #     func=mdp.ObservationHistory,
         #     params={"method": "joint_pos_error"},
-        #     history_indices=[-1, -3, -5], 
+        #     history_indices=[-1, -3, -5],
         #     asset_cfg=SceneEntityCfg("robot", joint_names=LEG_JOINT_NAMES,
         #                              joint_ids=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]), # have to manually specify joint_ids here
         #     noise=Unoise(n_min=-0.01, n_max=0.01),
@@ -355,7 +357,7 @@ class ObservationsCfg:
         # history_joint_vel = ObservationHistoryTermCfg(
         #     func=mdp.ObservationHistory,
         #     params={"method": "joint_vel"},
-        #     history_indices=[-3, -5], 
+        #     history_indices=[-3, -5],
         #     noise=Unoise(n_min=-1.5, n_max=1.5),
         # )  # 2*16
         # history_root_lin_vel = ObservationHistoryTermCfg(
@@ -542,7 +544,6 @@ class RewardsCfg:
     # track_speed_up = RewTerm(func=mdp.tracking_speed_up, weight=1.0, params={"goal_distance_thresh": 0.1, "std": 1.0})
     track_speed_up = RewTerm(func=mdp.tracking_speed_up, weight=4.0, params={"goal_distance_thresh": 0.1, "std": 1.0})
 
-
     #### Additional rewards ############################################################################
 
     straight_speed_bonus = RewTerm(func=mdp.straight_speed_bonus, weight=1.5)   # 직진 가속 부스트
@@ -578,7 +579,7 @@ class RewardsCfg:
     )
     stand_still_normalization = RewTerm(
         func=mdp.stand_still_normalization, weight=-0.5,
-        params={"goal_distance_thresh": 0.1, "goal_yaw_thresh": 100,}
+        params={"goal_distance_thresh": 0.1, "goal_yaw_thresh": 100, }
     )
 
     #### Torque Penalties ############################################################################
@@ -587,7 +588,7 @@ class RewardsCfg:
         weight=-1.0e-5,
         params={"asset_cfg": SceneEntityCfg("robot", joint_names=LEG_JOINT_NAMES)},
     )
-    joint_power_l1 = RewTerm(func=mdp.joint_power_l1, weight=-1.0e-4, params={"asset_cfg": SceneEntityCfg("robot", joint_names=LEG_JOINT_NAMES+WHEEL_JOINT_NAMES)})
+    joint_power_l1 = RewTerm(func=mdp.joint_power_l1, weight=-1.0e-4, params={"asset_cfg": SceneEntityCfg("robot", joint_names=LEG_JOINT_NAMES + WHEEL_JOINT_NAMES)})
 
     ### Velocity Penalties ###########################################################################
     joint_vel_l2_legs = RewTerm(
@@ -622,7 +623,6 @@ class RewardsCfg:
     # g_l2 = RewTerm(func=mdp.g_l2, weight=-0.01)
     g_l2 = RewTerm(func=mdp.g_l2, weight=-0.03)
     track_yaw_exp = RewTerm(func=mdp.track_yaw_exp, weight=0.1, params={"std": 0.2})
-    
 
     #### Termination Penalty ##########################################################################
     episode_termination = RewTerm(
@@ -665,7 +665,7 @@ class RewardsCfg:
     #### Optional Rewards ############################################################################
     # body_stumble = RewTerm(
     #     func=mdp.body_stumble, weight= 2e-3,
-    #     params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names=WHEEL_BODY_NAMES), "threshold": 2.0, 
+    #     params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names=WHEEL_BODY_NAMES), "threshold": 2.0,
     #             "asset_cfg": SceneEntityCfg("robot", body_names=WHEEL_BODY_NAMES) },
     # )
     # feet_air_time = RewTerm(
@@ -819,6 +819,12 @@ class TeacherPathTrackingEnvCfg(ManagerBasedRLEnvCfg):
 
         # check if terrain levels curriculum is enabled - if so, enable curriculum for terrain generator
         # this generates terrains with increasing difficulty and is useful for training
+        print(f"\n[DEBUG] ===================================================")
+        print(f"[DEBUG] TeacherPathTrackingEnvCfg.__post_init__")
+        print(f"[DEBUG] Effective PATH_CFG constant: {PATH_CFG}")
+        print(f"[DEBUG] Active path_config: {self.commands.path_command.path_config}")
+        print(f"[DEBUG] ===================================================\n")
+
         if getattr(self.curriculum, "path_terrain_difficulty", None) is not None:
             if self.scene.terrain.terrain_generator is not None and self.commands.path_command.path_config[
                 "terrain_level_range"
