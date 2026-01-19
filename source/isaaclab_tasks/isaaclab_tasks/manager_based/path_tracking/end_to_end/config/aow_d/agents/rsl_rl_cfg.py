@@ -30,19 +30,21 @@ from isaaclab_tasks.manager_based.path_tracking.data_augmentation_path import (
 ##
 
 # Train path-tracking high level control env
+
+
 @configclass
 class AoWDPathPPORunnerCfg(RslRlOnPolicyRunnerCfg):
     experiment_name = "Path_Tracking_AoW_D"
     run_name = "Teacher_PPO"
     num_steps_per_env = 24
-    max_iterations = 6000
+    max_iterations = 20000
     save_interval = 500
     empirical_normalization = True
 
     policy = RslRlPpoActorCriticCfg(
         init_noise_std=1.0,
-        actor_hidden_dims=[512, 256, 128],
-        critic_hidden_dims=[512, 256, 128],
+        actor_hidden_dims=[256, 128, 128],
+        critic_hidden_dims=[256, 128, 128],
         activation="elu",
     )
     algorithm = RslRlPpoAlgorithmCfg(

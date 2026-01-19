@@ -261,7 +261,19 @@ class OnPolicyMoERunner:
                 ckpt_dir = self.log_dir
                 os.makedirs(ckpt_dir, exist_ok=True)
                 ckpt_path = os.path.join(ckpt_dir, f"model_{it}.pt")
-                torch.save(expert_policy.state_dict(), ckpt_path)
+
+                # Save full checkpoint with normalizers
+                saved_dict = {
+                    "model_state_dict": expert_policy.state_dict(),
+                    "optimizer_state_dict": expert_alg.optimizer.state_dict(),
+                    "iter": it,
+                    "infos": {},
+                }
+                if self.empirical_normalization:
+                    saved_dict["obs_norm_state_dict"] = self.obs_normalizer.state_dict()
+                    saved_dict["privileged_obs_norm_state_dict"] = self.privileged_obs_normalizer.state_dict()
+
+                torch.save(saved_dict, ckpt_path)
                 print(f"[Stage A] Expert {expert_name} checkpoint saved at: {ckpt_path}")
 
         final_dir = self.log_dir

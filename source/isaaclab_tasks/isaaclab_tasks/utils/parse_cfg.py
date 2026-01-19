@@ -207,6 +207,25 @@ def get_checkpoint_path(
     model_checkpoints = [f for f in os.listdir(run_path) if re.match(checkpoint, f)]
     # check if any checkpoints are present
     if len(model_checkpoints) == 0:
+        # check if there are subdirectories (e.g. timestamps) that might contain the checkpoints
+        subdirs = [d for d in os.listdir(run_path) if os.path.isdir(os.path.join(run_path, d))]
+        if subdirs:
+            # Sort subdirectories to find the latest one
+            if sort_alpha:
+                subdirs.sort()
+            else:
+                subdirs = sorted(subdirs, key=lambda d: os.path.getmtime(os.path.join(run_path, d)))
+
+            # Try the last subdirectory
+            candidate_run_path = os.path.join(run_path, subdirs[-1])
+            candidate_checkpoints = [f for f in os.listdir(candidate_run_path) if re.match(checkpoint, f)]
+
+            if len(candidate_checkpoints) > 0:
+                print(f"[INFO] No checkpoints found in '{run_path}'. Found checkpoints in subdirectory '{subdirs[-1]}'. Using it.")
+                run_path = candidate_run_path
+                model_checkpoints = candidate_checkpoints
+
+    if len(model_checkpoints) == 0:
         raise ValueError(f"No checkpoints in the directory: '{run_path}' match '{checkpoint}'.")
     # sort alphabetically while ensuring that *_10 comes after *_9
     model_checkpoints.sort(key=lambda m: f"{m:0>15}")

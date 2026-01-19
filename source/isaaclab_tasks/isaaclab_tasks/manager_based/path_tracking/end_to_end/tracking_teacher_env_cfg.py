@@ -118,45 +118,45 @@ class MySceneCfg(InteractiveSceneCfg):
 if PATH_CFG == 'straight':
     MAX_SPEED = 4.5  # Max feasible speed
     _path_config_dict = {
-        "spline_angle_range": (0.0, 5.0),  # Very straight
-        "rotate_angle_range": (0.0, 5.0),  # Aligned with path
-        "pos_tolerance_range": (0.10, 0.15),
+        "spline_angle_range": (0.0, 10.0),  # Very straight
+        "rotate_angle_range": (0.0, 10.0),  # Aligned with path
+        "pos_tolerance_range": (0.2, 0.2),
         "terrain_level_range": (0, 0),
-        "resolution": [10.0, 5.0, 0.1, 1],
-        "initial_params": [0.0, 0.0, 0.10, 0],
+        "resolution": [10.0, 10.0, 0.2, 1],
+        "initial_params": [0.0, 0.0, 0.2, 0],
     }
 elif PATH_CFG == 'turn':
-    MAX_SPEED = 1.5  # Low speed for sharp turns
-    # Turn Config: Sharp angles & Finding path
+    MAX_SPEED = 3.5
+    # Turn Config:
     _path_config_dict = {
-        "spline_angle_range": (45.0, 90.0),   # Sharp curves
-        "rotate_angle_range": (0.0, 180.0),   # Path can start anywhere (turn to find)
-        "pos_tolerance_range": (0.20, 0.3),
+        "spline_angle_range": (10.0, 120.0),
+        "rotate_angle_range": (0.0, 70.0),
+        "pos_tolerance_range": (0.2, 0.2),
         "terrain_level_range": (0, 0),
-        "resolution": [5.0, 10.0, 0.2, 1],
-        "initial_params": [60.0, 90.0, 0.20, 0],
+        "resolution": [10.0, 10.0, 0.2, 1],
+        "initial_params": [60.0, 40.0, 0.2, 0],
     }
 elif PATH_CFG == 'drift':
-    # Drift Config: High speed + Moderate curves
+    # Drift Config:
     MAX_SPEED = 3.5
     _path_config_dict = {
-        "spline_angle_range": (20.0, 60.0),   # Curves suitable for drifting
-        "rotate_angle_range": (0.0, 45.0),    # Mostly aligned start, drift happens in curves
-        "pos_tolerance_range": (0.20, 0.3),
+        "spline_angle_range": (0.0, 120.0),
+        "rotate_angle_range": (70.0, 150.0),
+        "pos_tolerance_range": (0.2, 0.2),
         "terrain_level_range": (0, 0),
-        "resolution": [10.0, 12.0, 0.2, 1],
-        "initial_params": [30.0, 20.0, 0.25, 0],
+        "resolution": [10.0, 10.0, 0.2, 1],
+        "initial_params": [60.0, 110.0, 0.2, 0],
     }
-else:
+elif PATH_CFG == 'overall':
     # Default (Merge) fallback: Covers ALL ranges
     MAX_SPEED = 4.5
     _path_config_dict = {
-        "spline_angle_range": (0.0, 90.0),    # Straight to Sharp
-        "rotate_angle_range": (0.0, 180.0),   # Front to Back
-        "pos_tolerance_range": (0.10, 0.3),
+        "spline_angle_range": (0.0, 120.0),
+        "rotate_angle_range": (0.0, 150.0),
+        "pos_tolerance_range": (0.2, 0.2),  # original
         "terrain_level_range": (0, 0),
-        "resolution": [5.0, 12.0, 0.2, 1],
-        "initial_params": [0.0, 0.0, 0.20, 0],
+        "resolution": [10.0, 10.0, 0.2, 1],
+        "initial_params": [30.0, 40.0, 0.2, 0],  # [spline_angle, rotate_angle, pos_tolerance, terrain_level]
     }
 
 

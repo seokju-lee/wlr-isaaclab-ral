@@ -82,6 +82,68 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     task_name = args_cli.task.split(":")[-1]
     # override configurations with non-hydra CLI arguments
     agent_cfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
+
+    # Detect path configuration from checkpoint path
+    path_cfg_name = None
+    if args_cli.checkpoint:
+        ckpt_path = args_cli.checkpoint
+    elif args_cli.load_run:
+        # If load_run is used, we can try to guess from the run name if it contains the keywords
+        ckpt_path = args_cli.load_run
+    else:
+        ckpt_path = ""
+
+    if "drift" in ckpt_path.lower():
+        path_cfg_name = "drift"
+    elif "turn" in ckpt_path.lower():
+        path_cfg_name = "turn"
+    elif "straight" in ckpt_path.lower():
+        path_cfg_name = "straight"
+
+    if path_cfg_name:
+        print(f"[INFO] Auto-detected path configuration '{path_cfg_name}' from checkpoint path.")
+
+        # Define path configs (copied from tracking_teacher_env_cfg.py)
+        if path_cfg_name == 'straight':
+            # MAX_SPEED = 4.5
+            path_config_dict = {
+                "spline_angle_range": (0.0, 10.0),
+                "rotate_angle_range": (0.0, 10.0),
+                "pos_tolerance_range": (0.2, 0.2),
+                "terrain_level_range": (0, 0),
+                "resolution": [10.0, 10.0, 0.2, 1],
+                "initial_params": [0.0, 0.0, 0.2, 0],
+            }
+            max_speed = 4.5
+        elif path_cfg_name == 'turn':
+            # MAX_SPEED = 3.5
+            path_config_dict = {
+                "spline_angle_range": (10.0, 120.0),
+                "rotate_angle_range": (0.0, 70.0),
+                "pos_tolerance_range": (0.2, 0.2),
+                "terrain_level_range": (0, 0),
+                "resolution": [10.0, 10.0, 0.2, 1],
+                "initial_params": [60.0, 40.0, 0.2, 0],
+            }
+            max_speed = 3.5
+        elif path_cfg_name == 'drift':
+            # MAX_SPEED = 3.5
+            path_config_dict = {
+                "spline_angle_range": (0.0, 120.0),
+                "rotate_angle_range": (70.0, 150.0),
+                "pos_tolerance_range": (0.2, 0.2),
+                "terrain_level_range": (0, 0),
+                "resolution": [10.0, 10.0, 0.2, 1],
+                "initial_params": [60.0, 110.0, 0.2, 0],
+            }
+            max_speed = 3.5
+
+        # Apply override
+        if hasattr(env_cfg.commands, "path_command"):
+            env_cfg.commands.path_command.path_config = path_config_dict
+            env_cfg.commands.path_command.max_speed = max_speed
+            print(f"[INFO] Applied path configuration override for '{path_cfg_name}'.")
+
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
 
@@ -126,7 +188,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     print(f"[INFO]: Loading model checkpoint from: {resume_path}")
     # load previously trained model
     ppo_runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
-    ppo_runner.load(resume_path)
+    try:
+        ppo_runner.load(resume_path)
+    except KeyError:
+        # fallback for raw state dict (e.g. expert models from MoE pretraining)
+        print(f"[INFO] Checkpoint is not a standard RSL-RL runner checkpoint. Attempting to load as raw state dict...")
+        loaded_dict = torch.load(resume_path, map_location=ppo_runner.device)
+        ppo_runner.alg.policy.load_state_dict(loaded_dict)
 
     # obtain the trained policy for inference
     policy = ppo_runner.get_inference_policy(device=env.unwrapped.device)
