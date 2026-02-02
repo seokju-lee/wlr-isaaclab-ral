@@ -33,16 +33,17 @@ class ActorCriticMoE(ActorCritic):
         expert_hidden_critic=(256, 256),
         gate_hidden: int = 128,
         activation: str = "elu",
-        aux_gate_entropy_coef: float = 0.01,
+        aux_gate_entropy_coef: float = 0.01,  # CHANGED: Positive to reward entropy (exploration)
+        aux_load_balancing_coef: float = 2.0,  # CHANGED: Stronger penalty to break [1,0,0] collapse
         # RR-MoE args
-        use_residual: bool = True,
+        use_residual: bool = False,  # CHANGED: Disabled by default for MoE isolation test
         rnn_type: str = "lstm",
         rnn_hidden_dim: int = 256,
         rnn_num_layers: int = 1,
         # Transformer Gating args
-        use_transformer_gate: bool = True,
+        use_transformer_gate: bool = False,
         transformer_heads: int = 4,
-        transformer_layers: int = 1,
+        transformer_layers: int = 2,  # Compromise: 3 caused OOM, 1 is too simple
         transformer_dropout: float = 0.0,
         # keep ActorCritic kwargs compatible (noise, etc.)
         **kwargs,
@@ -86,9 +87,20 @@ class ActorCriticMoE(ActorCritic):
         # AND Residual Network usually takes Memory features (to be smart).
 
         self.actor_moe = _MoEActor(num_actor_obs, num_actions, num_experts, expert_hidden_actor, self._act)
-        # Critic experts typically expect num_critic_obs (if pretrained).
-        # We pass raw ONE-STEP obs to experts, but use RNN features for Gating.
-        self.critic_moe = _MoECritic(num_critic_obs, num_experts, expert_hidden_critic, self._act)
+        # 2. Critic Architecture -> GLOBAL MLP (Standard)
+        # Replaces MoE Critic to avoid bootstrapping crashes and gating mismatch.
+        # Simple MLP that learns V(s) for the mixed policy.
+        critic_layers = []
+        critic_layers.append(nn.Linear(rnn_hidden_dim, expert_hidden_critic[0]))
+        critic_layers.append(self._new_act())
+        for i in range(len(expert_hidden_critic) - 1):
+            critic_layers.append(nn.Linear(expert_hidden_critic[i], expert_hidden_critic[i + 1]))
+            critic_layers.append(self._new_act())
+        critic_layers.append(nn.Linear(expert_hidden_critic[-1], 1))
+        self.critic = nn.Sequential(*critic_layers)
+
+        # Removed MoE Critic
+        # self.critic_moe = _MoECritic(num_critic_obs, num_experts, expert_hidden_critic, self._act)
 
         # --- Gating Networks (Input: RNN features) ---
         # "Transformer-based Time-Aware Gating (T-Tag)"
@@ -126,15 +138,9 @@ class ActorCriticMoE(ActorCritic):
                 nn.Linear(gate_hidden, num_experts),
             )
 
-        # Value Gating (Critic): Usually simpler is fine, but for symmetry we can use MLP
-        # or share the transformer logic. For stability, let's keep Critic Gate as MLP for now
-        # or duplicate transformer? Transformer might be overkill for value function gating which just needs scalar.
-        # Let's keep Critic Gate as MLP to save compute, focusing novelty on Actor.
-        self.gate_value = nn.Sequential(
-            nn.Linear(rnn_hidden_dim, gate_hidden),
-            self._new_act(),
-            nn.Linear(gate_hidden, num_experts),
-        )
+        # Value Gating (Critic): NOT NEEDED for Global MLP Critic.
+        # self.gate_value = ... (Removed)
+        self.gate_value = None
 
         # --- Residual Actor (Input: RNN features) ---
         if self.use_residual:
@@ -161,15 +167,28 @@ class ActorCriticMoE(ActorCritic):
         else:
             self.log_std_moe = None
 
+        # Expert STDs (for Std Mixing)
+        self.expert_log_stds = nn.ParameterList([
+            nn.Parameter(torch.zeros(num_actions)) for _ in range(num_experts)
+        ])
+
+        # Learnable global correction for expert STDs.
+        # Experts might be too noisy (e.g. 1.87), so we allow the MoE to learn to reduce it.
+        # final_std = mixed_expert_std * exp(correction)
+        # INIT: -1.0 to start safe (~0.69 effective std) preventing -300 reward crash.
+        self.log_std_correction = nn.Parameter(torch.ones(num_actions) * -1.0)
+
         # Aux regularization
         self.gate_entropy_coef = aux_gate_entropy_coef
-        self.gate_entropy_coef = aux_gate_entropy_coef
+        self.load_balancing_coef = aux_load_balancing_coef
         self._last_gate_entropy = torch.tensor(0.0)
+        self._last_load_balance_loss = torch.tensor(0.0)
         self._last_gate_weights = None
+        self._gate_weights_for_loss = None
 
         # Keep ActorCritic.actor/critic pointing somewhere valid for tooling/debug APIs.
         self.actor = nn.Identity()
-        self.critic = nn.Identity()
+        # self.critic = nn.Identity() # This is now the global MLP critic
 
         # Disable arg checks for speed (as in base)
         Normal.set_default_validate_args(False)
@@ -256,7 +275,15 @@ class ActorCriticMoE(ActorCritic):
         with torch.no_grad():
             ent = (-weights * (weights.clamp_min(1e-8).log())).sum(dim=-1).mean()
             self._last_gate_entropy = ent
-            self._last_gate_weights = weights.mean(dim=0)
+            # Store full tensor for histogram logging (detached)
+            self._last_gate_weights = weights.detach()
+
+        # Store ATTACHED tensor for loss calculation
+        self._gate_weights_for_loss = weights
+
+        # DEBUG: Print Gating Weights occasionally
+        if torch.rand(1) < 0.001:  # approx every 1000 steps per env
+            print(f"[DEBUG] Gating Weights Mean: {weights.mean(dim=0).detach().cpu().numpy()}")
 
         # 3. Expert Execution (Skill) - Experts use RAW 'obs' (Pretrained on raw obs)
         expert_action = self.actor_moe(obs, weights)
@@ -290,23 +317,9 @@ class ActorCriticMoE(ActorCritic):
             features = features.reshape(T * B, D)
             critic_obs = critic_obs.reshape(T * B, -1)
 
-        logits = self.gate_value(features)
-        weights = F.softmax(logits, dim=-1)
-
-        # Critic experts: Should they take RAW obs or FEATURES?
-        # Pretrained experts might be standard ActorCritic experts. They expect raw obs.
-        # BUT... we are initializing _MoECritic with 'rnn_hidden_dim' input above.
-        # Wait, if we use pretrained experts, they expect 'num_critic_obs'.
-        # If we change input to 'rnn_hidden_dim', we cannot load pretrained weights if sizes differ.
-        # User wants to load "expert policies". Typically critic is also loaded?
-        # If experts are frozen, we MUST use their original input shape.
-        # So Critic Experts must take RAW 'critic_obs'.
-
-        # Correction: `self.critic_moe` init logic above passed `rnn_hidden_dim`.
-        # I MUST change it back to `num_critic_obs` if I intend to load pretrained critics.
-        # Assuming we correct __init__ to use num_critic_obs for critic_moe.
-
-        value = self.critic_moe(critic_obs, weights)  # [B, 1]
+        # Global MLP Critic Forward
+        # Simple V(s) prediction from features
+        value = self.critic(features)
 
         # Safety check for 2D input -> 3D output
         if is_2d_input and value.ndim == 3 and value.shape[0] == 1:
@@ -327,7 +340,21 @@ class ActorCriticMoE(ActorCritic):
         # Handle recurrence args
         mean = self._actor_mean(observations, masks, hidden_states)
         # ... logic for std ...
-        if hasattr(self, "noise_std_type") and self.noise_std_type == "scalar":
+        # Std Mixing Strategy (Priority High):
+        # Always mix expert STDs if available, regardless of base noise config.
+        # This fixes the issue where default "scalar" type blocked mixing.
+        if hasattr(self, "expert_log_stds") and self._gate_weights_for_loss is not None:
+            # [NumExperts, NumActions]
+            all_expert_stds = torch.stack([torch.exp(ls) for ls in self.expert_log_stds])
+            # [Batch, NumExperts] @ [NumExperts, NumActions] -> [Batch, NumActions]
+            # We use accurate weights from the current forward pass
+            # [Batch, NumExperts] @ [NumExperts, NumActions] -> [Batch, NumActions]
+            # We use accurate weights from the current forward pass
+            mixed_std = self._gate_weights_for_loss @ all_expert_stds
+
+            # Apply learnable correction: allow model to dampen (or boost) the expert noise
+            std = mixed_std * torch.exp(self.log_std_correction)
+        elif hasattr(self, "noise_std_type") and self.noise_std_type == "scalar":
             std = self.std.expand_as(mean)
         elif hasattr(self, "noise_std_type") and self.noise_std_type == "log":
             std = torch.exp(self.log_std).expand_as(mean)
@@ -367,28 +394,62 @@ class ActorCriticMoE(ActorCritic):
         return super().get_actions_log_prob(actions)
 
     def regularization_loss(self):
-        # Encourage high gate entropy for diversity
+        # 1. Entropy Loss: Encourage high gate entropy PER SAMPLE (uncertainty)
         # Negative sign: larger entropy -> smaller loss
-        return -self.gate_entropy_coef * self._last_gate_entropy
+        entropy_loss = -self.gate_entropy_coef * self._last_gate_entropy
+
+        # 2. Load Balancing Loss: Encourage UNIFORM usage across the batch
+        # We want mean_weights to be close to 1/num_experts
+        if self._gate_weights_for_loss is not None:
+            # [NumExperts]
+            # Use the attached tensor so gradients flow back to the gate
+            mean_usage = self._gate_weights_for_loss.mean(dim=0)
+
+            # Robustly get num_experts (avoid shape[0] crash if mean_usage is scalar)
+            num_experts = len(self.actor_moe.experts)
+            target_usage = torch.ones_like(mean_usage) / num_experts
+
+            # MSE between actual usage and uniform usage
+            lb_loss = (mean_usage - target_usage).pow(2).mean()
+            self._last_load_balance_loss = lb_loss
+            # Note: We return self._last_load_balance_loss which is now attached (if calculation was attached)
+            # Actually self._last_load_balance_loss = lb_loss assigns the variable.
+            # But the return statement creates a new graph node.
+        else:
+            lb_loss = torch.tensor(0.0, device=self.device if hasattr(self, "device") else "cpu")
+
+        return entropy_loss + self.load_balancing_coef * lb_loss
 
     def freeze_experts(self):
         """Freeze the weights of the expert networks (actor and critic)."""
         print("[ActorCriticMoE] Freezing expert weights.")
         for param in self.actor_moe.parameters():
             param.requires_grad = False
-        for param in self.critic_moe.parameters():
+            param.requires_grad = False
+        # Critic is now Global MLP and TRAINABLE. Do not freeze.
+        # for param in self.critic_moe.parameters():
+        #     param.requires_grad = False
+        # Also freeze expert STDs
+        for param in self.expert_log_stds.parameters():
             param.requires_grad = False
 
     def get_gate_info(self):
         """Return dict of gating stats (mean entropy, mean weights per expert)."""
         info = {
             "gate_entropy": self._last_gate_entropy.item(),
+            "load_balance_loss": self._last_load_balance_loss.item(),
         }
         if self._last_gate_weights is not None:
-            # Convert tensor to list for readability
-            ws = self._last_gate_weights.cpu().numpy().tolist()
+            # 1. Scalar means for easy tracking
+            # _last_gate_weights is [Batch, NumExperts]
+            mean_weights = self._last_gate_weights.mean(dim=0).reshape(-1)
+            ws = mean_weights.cpu().numpy().tolist()
             for i, w in enumerate(ws):
                 info[f"expert_{i}_weight"] = w
+
+            # 2. Full tensor for histogram logging
+            info["gate_weights"] = self._last_gate_weights
+
         return info
 
 

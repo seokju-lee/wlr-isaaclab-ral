@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import sys
 import time
+import math
 import statistics
 import torch
 from collections import deque
@@ -304,19 +305,23 @@ class OnPolicyMoERunner:
                 suffix = k[len("actor."):]
                 new_key = f"actor_moe.experts.{expert_idx}.{suffix}"
                 new_state_dict[new_key] = v
-            elif k.startswith("critic."):
-                suffix = k[len("critic."):]
-                new_key = f"critic_moe.experts.{expert_idx}.{suffix}"
-                new_state_dict[new_key] = v
+            # elif k.startswith("critic."):
+            #     # GLOBAL CRITIC CHANGE: Do not load expert critic weights.
+            #     # We use a single global critic trained from scratch.
+            #     suffix = k[len("critic."):]
+            #     new_key = f"critic_moe.experts.{expert_idx}.{suffix}"
+            #     new_state_dict[new_key] = v
+
             # 2) Single-Expert MoE (index 0) -> MoE Expert i
             elif k.startswith("actor_moe.experts.0."):
                 suffix = k[len("actor_moe.experts.0."):]
                 new_key = f"actor_moe.experts.{expert_idx}.{suffix}"
                 new_state_dict[new_key] = v
-            elif k.startswith("critic_moe.experts.0."):
-                suffix = k[len("critic_moe.experts.0."):]
-                new_key = f"critic_moe.experts.{expert_idx}.{suffix}"
-                new_state_dict[new_key] = v
+            # elif k.startswith("critic_moe.experts.0."):
+            #     # GLOBAL CRITIC CHANGE: Do not load expert critic weights.
+            #     suffix = k[len("critic_moe.experts.0."):]
+            #     new_key = f"critic_moe.experts.{expert_idx}.{suffix}"
+            #     new_state_dict[new_key] = v
 
         if not new_state_dict:
             print(f"[WARNING] No matching keys found in expert checkpoint for expert {expert_idx}! Keys in ckpt: {list(state_dict.keys())[:5]}...")
@@ -566,7 +571,28 @@ class OnPolicyMoERunner:
 
             # Helper to extracting weights for one MLP and putting into another
             # We assume specialized experts are standard MLPs or matching architecture.
-            self._load_expert_weights(policy, i, torch.load(ckpt_path, map_location=self.device))
+            loaded_dict = torch.load(ckpt_path, map_location=self.device)
+            print(f"[DEBUG] Loaded expert {i} keys: {list(loaded_dict['model_state_dict'].keys())[:5]}...")
+            self._load_expert_weights(policy, i, loaded_dict)
+
+            # Load expert std/log_std for mixing
+            if hasattr(policy, "expert_log_stds"):
+                msd = loaded_dict['model_state_dict']
+                # Check for 'log_std' or 'std'
+                if "log_std" in msd:
+                    print(f"[INFO] Expert {i}: Loading learned log_std.")
+                    with torch.no_grad():
+                        policy.expert_log_stds[i].data.copy_(msd["log_std"])
+                elif "std" in msd:
+                    print(f"[INFO] Expert {i}: Loading learned std (converting to log_std).")
+                    with torch.no_grad():
+                        policy.expert_log_stds[i].data.copy_(torch.log(msd["std"]))
+                else:
+                    print(f"[WARNING] Expert {i}: No std found! Using default {policy.expert_log_stds[i].data.mean().item()}")
+
+                # DEBUG: Print the actual loaded value
+                loaded_std = torch.exp(policy.expert_log_stds[i].data).mean().item()
+                print(f"[DEBUG] Expert {i} Loaded Mean Std: {loaded_std:.4f}")
 
         # Freeze experts to keep specialization
         policy.freeze_experts()
@@ -581,6 +607,61 @@ class OnPolicyMoERunner:
             [num_privileged_obs],
             [self.env.num_actions],
         )
+
+        # ---------------------------------------------------------------------
+        # Normalize Init Fix: Load and Average Expert Normalization Stats
+        # ---------------------------------------------------------------------
+        if self.empirical_normalization:
+            print("[INFO] Averaging observation normalizer stats from experts...")
+            running_mean_sum = 0
+            running_var_sum = 0
+            count_sum = 0
+
+            # UNION NORMALIZATION STRATEGY (Max Variance)
+            # Solves Input Explosion (-2000 Reward) caused by "Anchor" strategy where Straight expert
+            # has zero variance for Turn/Drift channels.
+            # We take the MAX variance across all experts to ensure safe scaling for ANY skill.
+
+            all_means = []
+            all_vars = []
+
+            print("[INFO] Computing Union Normalization Stats (Max Variance)...")
+            valid_experts_found = 0
+            for i, ckpt_path in enumerate(moe_expert_paths):
+                try:
+                    loaded_dict = torch.load(ckpt_path, map_location=self.device)
+                    if "obs_norm_state_dict" in loaded_dict:
+                        norm_state = loaded_dict["obs_norm_state_dict"]
+                        all_means.append(norm_state["_mean"])
+                        all_vars.append(norm_state["_var"])
+                        valid_experts_found += 1
+                        print(f"[DEBUG] Loaded stats from Expert {i}")
+                except Exception as e:
+                    print(f"[WARNING] Failed to load normalization stats from {ckpt_path}: {e}")
+
+            if valid_experts_found > 0:
+                # 1. Union Mean: Average of experts (Safe centering)
+                union_mean = torch.stack(all_means).mean(dim=0)
+
+                # 2. Union Var: MAXIMUM variance across experts (CRITICAL FIX)
+                # Prevents dividing by near-zero variance if one expert (e.g. Straight) didn't use a channel.
+                union_var, _ = torch.stack(all_vars).max(dim=0)
+
+                # Warm Start Trick:
+                # Reset count to allow adaptation, but start with safe Union stats.
+                avg_count = torch.tensor(100000, device=self.device, dtype=torch.long)
+
+                # Apply to current normalizer
+                self.obs_normalizer._mean.copy_(union_mean)
+                self.obs_normalizer._var.copy_(union_var)
+                self.obs_normalizer.count.copy_(avg_count)
+                # Force re-calc of std
+                self.obs_normalizer._std = torch.sqrt(self.obs_normalizer._var)
+                print(f"[INFO] Initialized obs_normalizer with UNION stats (Max Var). Count reset to {avg_count.item()}.")
+                print(f"[DEBUG] Union Var Range: {union_var.min().item():.4f} - {union_var.max().item():.4f}")
+            else:
+                print("[WARNING] No valid normalization stats found in expert checkpoints. Using default (uninitialized).")
+        # ---------------------------------------------------------------------
 
         # Ensure parameters in-sync for DDP
         if self.is_distributed:
@@ -751,7 +832,26 @@ class OnPolicyMoERunner:
                 gate_info = self.alg.policy.get_gate_info()
                 total_num_steps = locs["it"] * self.num_steps_per_env * self.env.num_envs
                 for k, v in gate_info.items():
-                    self.writer.add_scalar(f"MoE/{k}", v, total_num_steps)
+                    if k == "gate_weights":
+                        # Log histograms for each expert
+                        if hasattr(self.writer, "add_histogram"):
+                            # v is [Batch, NumExperts]
+                            for i in range(v.shape[1]):
+                                expert_name = self.valid_experts[i] if i < len(self.valid_experts) else f"expert_{i}"
+                                self.writer.add_histogram(f"MoE/{expert_name}_dist", v[:, i], total_num_steps)
+                    elif k.startswith("expert_") and k.endswith("_weight"):
+                        # Parse index to replace with name: expert_0_weight -> straight_weight
+                        try:
+                            parts = k.split("_")
+                            # expert_0_weight -> parts=["expert", "0", "weight"]
+                            idx = int(parts[1])
+                            expert_name = self.valid_experts[idx] if idx < len(self.valid_experts) else f"expert_{idx}"
+                            self.writer.add_scalar(f"MoE/{expert_name}_weight", v, total_num_steps)
+                        except (ValueError, IndexError):
+                            self.writer.add_scalar(f"MoE/{k}", v, total_num_steps)
+                    else:
+                        # Log other metrics (entropy, load_balance_loss)
+                        self.writer.add_scalar(f"MoE/{k}", v, total_num_steps)
                 # Print weights occasionally
                 if "expert_0_weight" in gate_info:
                     w_str = " | ".join([f"E{i}: {gate_info.get(f'expert_{i}_weight', 0):.2f}" for i in range(len(self.valid_experts))])
@@ -780,6 +880,50 @@ class OnPolicyMoERunner:
                 )
             log_string += f"""{'Mean reward:':>{pad}} {statistics.mean(locs['rewbuffer']):.2f}\n"""
             log_string += f"""{'Mean episode length:':>{pad}} {statistics.mean(locs['lenbuffer']):.2f}\n"""
+
+            # Debug gradients
+            alg_policy = self.alg.policy
+            grad_norm = 0.0
+            found_gate = False
+
+            # Check MLP Gate
+            if hasattr(alg_policy, "gate_actor"):
+                found_gate = True
+                for p in alg_policy.gate_actor.parameters():
+                    if p.grad is not None:
+                        grad_norm += p.grad.norm().item()
+
+            # Check Transformer Gate
+            if hasattr(alg_policy, "gate_transformer"):
+                found_gate = True
+                for p in alg_policy.gate_transformer.parameters():
+                    if p.grad is not None:
+                        grad_norm += p.grad.norm().item()
+                # Also gate_out
+                if hasattr(alg_policy, "gate_out"):
+                    for p in alg_policy.gate_out.parameters():
+                        if p.grad is not None:
+                            grad_norm += p.grad.norm().item()
+
+            if found_gate:
+                log_string += f"""{'Gate Grad Norm:':>{pad}} {grad_norm:.4f}\n"""
+
+            # Debug Std Grad
+            std_grad = 0.0
+            if hasattr(alg_policy, "log_std") and alg_policy.log_std is not None and alg_policy.log_std.grad is not None:
+                std_grad = alg_policy.log_std.grad.norm().item()
+            elif hasattr(alg_policy, "log_std_moe") and alg_policy.log_std_moe is not None and alg_policy.log_std_moe.grad is not None:
+                std_grad = alg_policy.log_std_moe.grad.norm().item()
+            log_string += f"""{'Std Grad Norm:':>{pad}} {std_grad:.4f}\n"""
+
+            # Debug Obs/Act Stats
+            obs_norm = self.obs_normalizer.mean.norm().item() if self.empirical_normalization else 0.0
+            with torch.no_grad():
+                actions = self.alg.policy.act_inference(locs["obs"])  # Sample actions for debug
+                act_mean = actions.mean().item()
+                act_std_val = actions.std().item()
+            log_string += f"""{'Obs Mean Norm:':>{pad}} {obs_norm:.4f}\n"""
+            log_string += f"""{'Act Mean/Std:':>{pad}} {act_mean:.4f} / {act_std_val:.4f}\n"""
         else:
             log_string = (
                 f"""{'#' * width}\n"""
@@ -861,13 +1005,17 @@ class OnPolicyMoERunner:
         return policy
 
     def train_mode(self):
-        """Switch modules to train mode."""
+        """Switch modules to train mode (but freeze obs normalizers)."""
         self.alg.policy.train()
         if self.alg.rnd:
             self.alg.rnd.train()
+
+        # Override: Freeze Observation Normalizers
+        # Experts are frozen and expect the loaded "Anchor" stats.
+        # Updating them causes drift and catastrophic failure.
         if self.empirical_normalization:
-            self.obs_normalizer.train()
-            self.privileged_obs_normalizer.train()
+            self.obs_normalizer.eval()
+            self.privileged_obs_normalizer.eval()
 
     def eval_mode(self):
         """Switch modules to eval mode."""

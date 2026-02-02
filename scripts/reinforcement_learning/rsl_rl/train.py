@@ -51,6 +51,9 @@ sys.argv = [sys.argv[0]] + hydra_args
 if args_cli.stage == 1 and args_cli.expert_type is not None:
     os.environ["RSL_RL_PATH_CFG"] = args_cli.expert_type
     print(f"[INFO] Set environment variable RSL_RL_PATH_CFG={args_cli.expert_type}")
+elif args_cli.stage == 2:
+    os.environ["RSL_RL_PATH_CFG"] = "overall"
+    print(f"[INFO] Set environment variable RSL_RL_PATH_CFG='overall' (Stage 2)")
 # launch omniverse app
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app

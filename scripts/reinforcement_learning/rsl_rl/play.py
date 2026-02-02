@@ -186,8 +186,44 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
 
     print(f"[INFO]: Loading model checkpoint from: {resume_path}")
-    # load previously trained model
-    ppo_runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
+
+    # Check if checkpoint is MoE
+    try:
+        ckpt_dict = torch.load(resume_path, map_location="cpu")
+        model_state_dict = ckpt_dict.get("model_state_dict", ckpt_dict)
+        is_moe = False
+        for k in model_state_dict.keys():
+            if "gate_transformer" in k or "actor_moe" in k:
+                is_moe = True
+                break
+
+        if is_moe:
+            print("[INFO] Auto-detected MoE checkpoint. Switching policy to ActorCriticMoE.")
+            # Convert to dict first to allow flexible modification
+            agent_cfg_dict = agent_cfg.to_dict()
+
+            if "policy" not in agent_cfg_dict:
+                agent_cfg_dict["policy"] = {}
+
+            agent_cfg_dict["policy"]["class_name"] = "ActorCriticMoE"
+            # Add MoE args (using defaults from training)
+            agent_cfg_dict["policy"]["num_experts"] = 3
+            agent_cfg_dict["policy"]["use_transformer_gate"] = True
+            agent_cfg_dict["policy"]["transformer_layers"] = 2
+            agent_cfg_dict["policy"]["transformer_heads"] = 4
+            agent_cfg_dict["policy"]["aux_load_balancing_coef"] = 0.5
+            agent_cfg_dict["policy"]["aux_gate_entropy_coef"] = 0.0
+
+            # Use the modified dict instead of original agent_cfg object
+            ppo_runner = OnPolicyRunner(env, agent_cfg_dict, log_dir=None, device=agent_cfg.device)
+        else:
+            # Standard loading
+            ppo_runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
+
+    except Exception as e:
+        print(f"[WARNING] Failed to inspect checkpoint structure: {e}")
+        # Fallback to standard loading if inspection fails
+        ppo_runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
     try:
         ppo_runner.load(resume_path)
     except KeyError:

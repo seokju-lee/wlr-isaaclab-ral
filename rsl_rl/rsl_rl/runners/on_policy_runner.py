@@ -20,6 +20,7 @@ from rsl_rl.modules import (
     EmpiricalNormalization,
     StudentTeacher,
     StudentTeacherRecurrent,
+    ActorCriticMoE,
 )
 from rsl_rl.utils import store_code_state
 
@@ -462,7 +463,8 @@ class OnPolicyRunner:
         if self.cfg["empirical_normalization"]:
             if device is not None:
                 self.obs_normalizer.to(device)
-            policy = lambda x: self.alg.policy.act_inference(self.obs_normalizer(x))  # noqa: E731
+
+            def policy(x): return self.alg.policy.act_inference(self.obs_normalizer(x))  # noqa: E731
         return policy
 
     def train_mode(self):
